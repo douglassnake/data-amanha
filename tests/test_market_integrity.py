@@ -52,6 +52,13 @@ class TestMarketIntegrity(unittest.TestCase):
         self.assertIn("2026-11-11T14:10:00+00:00", result["Última observação (UTC)"])
         self.assertIn("atraso", result["Modalidade"])
 
+    def test_unix_epoch_seconds_and_milliseconds(self):
+        seconds = env["market_timestamp"]("1794412800")
+        millis = env["market_timestamp"]("1794412800000")
+        self.assertIsNotNone(seconds)
+        self.assertEqual(seconds, millis)
+        self.assertEqual(seconds.tzinfo, timezone.utc)
+
     def test_no_timestamp_claim_if_timezone_missing(self):
         stamps = pd.date_range("2026-11-11", periods=2, freq="5min")
         result = env["parse_yahoo_bar"]("MSFT", pd.Series([100, 105], index=stamps))
