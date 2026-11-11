@@ -1,5 +1,7 @@
 
 import io
+import os
+from urllib.parse import quote as url_quote
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from email.utils import parsedate_to_datetime
@@ -534,6 +536,276 @@ def macro_summary_text(signal_df):
     return " | ".join(parts)
 
 
+
+# ---------- Mercado verificável v9: dados reais e qualidade da fonte ----------
+# Coinbase: último negócio em bolsa. Yahoo: barras indicativas, possivelmente atrasadas.
+# A ativação de dados proprietários em painel público exige licença de exibição.
+LIVE_UNIVERSES = {
+    "Panorama": [
+        ("Bitcoin", "BTC-USD", "Coinbase", "USD"),
+        ("Ethereum", "ETH-USD", "Coinbase", "USD"),
+        ("S&P 500", "^GSPC", "Yahoo", "pontos"),
+        ("Nasdaq 100", "^NDX", "Yahoo", "pontos"),
+        ("Ibovespa", "^BVSP", "Yahoo", "pontos"),
+        ("USD/BRL", "BRL=X", "Yahoo", "BRL por USD"),
+        ("Ouro (futuro)", "GC=F", "Yahoo", "USD/onça"),
+        ("Brent (futuro)", "BZ=F", "Yahoo", "USD/barril"),
+    ],
+    "Índices": [(n, t, "Yahoo", "pontos") for n,t in MACRO_UNIVERSE["Índices"].items()],
+    "Câmbio": [(n, t, "Yahoo", "unidade do par") for n,t in MACRO_UNIVERSE["Moedas"].items()],
+    "Criptomoedas": [
+        (n, t, "Coinbase", "USD") for n,t in [
+            ("Bitcoin","BTC-USD"),("Ethereum","ETH-USD"),("Solana","SOL-USD"),
+            ("XRP","XRP-USD"),("Dogecoin","DOGE-USD")
+        ]
+    ],
+    "Commodities": [(n,t,"Yahoo","unidade do contrato") for n,t in MACRO_UNIVERSE["Commodities"].items()],
+    "Ações e ETFs": [(n,t,"Yahoo",u) for n,t,u in [
+        ("S&P 500 ETF","SPY","USD"),("Energia ETF","XLE","USD"),
+        ("Tecnologia ETF","XLK","USD"),("Saúde ETF","XLV","USD"),
+        ("Apple","AAPL","USD"),("Microsoft","MSFT","USD"),
+        ("NVIDIA","NVDA","USD"),("Petrobras PN","PETR4.SA","BRL"),
+        ("Vale ON","VALE3.SA","BRL")
+    ]],
+}
+COINBASE_ALLOWED = {"BTC-USD","ETH-USD","SOL-USD","XRP-USD","DOGE-USD"}
+LICENSED_US_TICKERS = {"SPY","XLE","XLK","XLV","AAPL","MSFT","NVDA"}
+
+
+def valid_market_price(value):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) and number > 0 else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def market_timestamp(value):
+    if value is None or value == "":
+        return None
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+        return None if pd.isna(ts) else ts.to_pydatetime()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def age_description(ts, threshold_seconds):
+    if ts is None:
+        return "Horário da fonte indisponível"
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age < -300:
+        return "Horário inconsistente"
+    return "Observação recente" if age <= threshold_seconds else "Sem observação recente / mercado fechado"
+
+
+def parse_coinbase_trade(symbol, payload):
+    if symbol not in COINBASE_ALLOWED or not isinstance(payload, dict):
+        return None
+    p = valid_market_price(payload.get("price"))
+    ts = market_timestamp(payload.get("time"))
+    if p is None or ts is None:
+        return None
+    return {
+        "Ticker": symbol, "Preço": p, "Última observação (UTC)": ts.isoformat(),
+        "Fonte": "Coinbase Exchange", "Modalidade": "Último negócio informado",
+        "Qualidade": age_description(ts, 180),
+        "Link": "https://api.exchange.coinbase.com/products/" + symbol + "/ticker"
+    }
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_coinbase_trade(symbol):
+    if not REQUESTS_OK or symbol not in COINBASE_ALLOWED:
+        return None
+    try:
+        response = requests.get(
+            "https://api.exchange.coinbase.com/products/" + symbol + "/ticker",
+            headers={"Accept": "application/json", "User-Agent": "DataAmanhaObservatorio/1.0"},
+            timeout=(3, 7),
+        )
+        response.raise_for_status()
+        return parse_coinbase_trade(symbol, response.json())
+    except (requests.RequestException, ValueError):
+        return None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_yahoo_intraday(tickers):
+    if not YF_OK or not tickers:
+        return pd.DataFrame()
+    try:
+        raw = yf.download(
+            tickers=list(tickers), period="5d", interval="5m", group_by="ticker",
+            auto_adjust=False, progress=False, threads=False, timeout=12
+        )
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    data = {}
+    for ticker in tickers:
+        series = None
+        if isinstance(raw.columns, pd.MultiIndex):
+            if (ticker, "Close") in raw.columns:
+                series = raw[(ticker, "Close")]
+            elif ("Close", ticker) in raw.columns:
+                series = raw[("Close", ticker)]
+        elif len(tickers) == 1 and "Close" in raw.columns:
+            series = raw["Close"]
+        if series is not None:
+            series = pd.to_numeric(series, errors="coerce").dropna()
+            series = series[np.isfinite(series) & (series > 0)]
+            if len(series):
+                data[ticker] = series
+    return pd.DataFrame(data)
+
+
+def parse_yahoo_bar(ticker, bars):
+    bars = pd.to_numeric(bars, errors="coerce").dropna()
+    bars = bars[np.isfinite(bars) & (bars > 0)]
+    if bars.empty:
+        return None
+    idx = pd.Timestamp(bars.index[-1])
+    # Sem timezone informado não é correto derivar uma hora UTC.
+    ts = idx.tz_convert("UTC").to_pydatetime() if idx.tzinfo is not None else None
+    return {
+        "Ticker": ticker, "Preço": float(bars.iloc[-1]),
+        "Última observação (UTC)": ts.isoformat() if ts else "Fuso não informado",
+        "Fonte": "Yahoo Finance / yfinance",
+        "Modalidade": "Barra indicativa de 5 min (pode ter atraso)",
+        "Qualidade": age_description(ts, 1200),
+        "Link": "https://finance.yahoo.com/quote/" + url_quote(ticker, safe="")
+    }
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_licensed_twelve_quotes(tickers, secret):
+    if not REQUESTS_OK or not secret:
+        return {}
+    result = {}
+    for symbol in tuple(tickers)[:6]:
+        if symbol not in LICENSED_US_TICKERS:
+            continue
+        try:
+            res = requests.get(
+                "https://api.twelvedata.com/quote",
+                headers={"Authorization": "apikey " + secret},
+                params={"symbol": symbol}, timeout=(3, 7),
+            )
+            res.raise_for_status()
+            item = res.json()
+            if not isinstance(item, dict) or item.get("status") == "error":
+                continue
+            price = valid_market_price(item.get("close"))
+            if price is None:
+                continue
+            ts = market_timestamp(item.get("timestamp"))
+            result[symbol] = {
+                "Ticker": symbol, "Preço": price,
+                "Última observação (UTC)": ts.isoformat() if ts else "Não informado",
+                "Fonte": "Twelve Data (licença de exibição)",
+                "Modalidade": "Segundo cobertura e plano contratado",
+                "Qualidade": age_description(ts, 300),
+                "Link": "https://twelvedata.com/docs"
+            }
+        except (requests.RequestException, ValueError):
+            continue
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_bcb_reference():
+    """Selic/meta SGS 432 e IPCA mensal SGS 433; referências, não ticks."""
+    result = []
+    if not REQUESTS_OK:
+        return result
+    for name, code, unit in [("Meta Selic",432,"% a.a."),("IPCA mensal",433,"% no mês")]:
+        url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados/ultimos/1?formato=json"
+        try:
+            response = requests.get(url, timeout=(3,7))
+            response.raise_for_status()
+            data = response.json()
+            item = data[-1] if isinstance(data,list) and data else None
+            if not isinstance(item,dict):
+                continue
+            value = float(str(item.get("valor","")).replace(",","."))
+            if np.isfinite(value):
+                result.append({"Indicador":name,"Valor":value,"Unidade":unit,
+                               "Referência":item.get("data","N/D"),"Fonte":url})
+        except (requests.RequestException,ValueError,TypeError):
+            pass
+    return pd.DataFrame(result)
+
+
+def assemble_live_market(group, licensed=False, secret=""):
+    wanted = LIVE_UNIVERSES[group]
+    tickers = tuple(t for n,t,p,u in wanted if p == "Yahoo")
+    yahoo = fetch_yahoo_intraday(tickers) if tickers else pd.DataFrame()
+    twelve = fetch_licensed_twelve_quotes(
+        tuple(t for t in tickers if t in LICENSED_US_TICKERS), secret
+    ) if licensed and secret else {}
+    records = []
+    for name, ticker, provider, unit in wanted:
+        row = None
+        if provider == "Coinbase":
+            row = fetch_coinbase_trade(ticker)
+        elif ticker in twelve:
+            row = twelve[ticker]
+        elif ticker in yahoo.columns:
+            row = parse_yahoo_bar(ticker, yahoo[ticker])
+        if row:
+            records.append({**row,"Ativo":name,"Unidade":unit})
+    return pd.DataFrame(records)
+
+
+@st.fragment(run_every="60s")
+def live_market_panel():
+    st.subheader("Mercado observado — sem preços inventados")
+    st.warning("A hora da consulta não é a hora da negociação. Cripto: último negócio Coinbase. Ações, ETFs, índices, moedas e futuros: dados indicativos Yahoo, possivelmente atrasados. Não use para executar ordens.")
+    group = st.selectbox("Mercado", list(LIVE_UNIVERSES), key="live_universe")
+    if st.button("Atualizar agora", key="live_force_refresh"):
+        fetch_coinbase_trade.clear()
+        fetch_yahoo_intraday.clear()
+        fetch_licensed_twelve_quotes.clear()
+        fetch_bcb_reference.clear()
+    secret = os.environ.get("TWELVE_DATA_API_KEY", "")
+    redisplay_allowed = os.environ.get("MARKET_PUBLIC_DISPLAY_LICENSED", "").lower() in ("yes","true","1")
+    quotes = assemble_live_market(group, redisplay_allowed, secret)
+    now = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Sao_Paulo"))
+    st.caption("Consulta em " + now.strftime("%d/%m/%Y %H:%M:%S (Brasília)") + " · atualização automática a cada 60 s durante a sessão do painel")
+    a,b,c = st.columns(3)
+    a.metric("Ativos selecionados", len(LIVE_UNIVERSES[group]))
+    b.metric("Com cotação da fonte", len(quotes))
+    c.metric("Indisponíveis", len(LIVE_UNIVERSES[group])-len(quotes))
+    if quotes.empty:
+        st.error("Nenhuma fonte retornou cotação válida. O painel não substitui ausências por zeros ou estimativas.")
+    else:
+        for offset in range(0, min(4,len(quotes)), 4):
+            cols = st.columns(min(4,len(quotes)-offset))
+            for j,col in enumerate(cols):
+                row = quotes.iloc[offset+j]
+                col.metric(row["Ativo"], f"{row['Preço']:,.2f}", row["Unidade"], delta_color="off")
+        fields = ["Ativo","Ticker","Preço","Unidade","Fonte","Modalidade","Última observação (UTC)","Qualidade","Link"]
+        st.dataframe(quotes[fields], use_container_width=True, hide_index=True,
+            column_config={"Link": st.column_config.LinkColumn("Ver fonte")})
+        st.download_button("Exportar cotações reais (CSV)",
+            quotes.to_csv(index=False).encode("utf-8-sig"),
+            file_name="data_amanha_cotacoes_verificadas.csv",
+            mime="text/csv", key="download_live_market")
+        st.caption("Índices em pontos; câmbio conforme orientação do par (USD/BRL = reais por dólar); commodities são contratos futuros, não preços à vista.")
+    st.markdown("#### Referências oficiais brasileiras")
+    ref = fetch_bcb_reference()
+    if ref.empty:
+        st.info("Banco Central não respondeu nesta consulta. Nenhum valor foi presumido.")
+    else:
+        st.dataframe(ref, use_container_width=True, hide_index=True,
+            column_config={"Fonte":st.column_config.LinkColumn("Banco Central")})
+        st.caption("Selic meta (SGS 432): percentual ao ano. IPCA (SGS 433): variação mensal. Fontes oficiais, não intradiárias.")
+    st.caption("A exibição de dados licenciados da Twelve Data só será ativada se houver chave no Render e autorização formal de redistribuição pública (MARKET_PUBLIC_DISPLAY_LICENSED=1). Não inclua chaves no GitHub. Histórico 1900–2026 permanece heurístico e isolado dos preços.")
+
+
+
 # ---------- News and emergency monitoring (v8) ----------
 NEWS_TTL_SECONDS = 600  # cache for ten minutes; actual updates depend on the source
 SOURCE_LINKS = {
@@ -942,7 +1214,7 @@ def show_institutional_header():
 
 apply_institutional_style()
 show_institutional_header()
-st.caption("Histórico · Previsões · Padrões · Cenários · Mercado financeiro · Notícias · Defesa Civil")
+st.caption("Histórico · Previsões · Padrões · Cenários · Mercado observado · Notícias · Defesa Civil")
 st.info("**Aviso de transparência:** a série histórica 1900–2026 é **heurística e ilustrativa**, não oficial. Os scores de risco/retorno são hipóteses do modelo, não previsões validadas nem recomendações de investimento. Este é um painel independente e **não substitui alertas oficiais da Defesa Civil**.")
 
 with st.sidebar:
@@ -1049,6 +1321,7 @@ tabs = st.tabs([
     "Sinais",
     "Dados e exportação",
     "Monitoramento ao vivo",
+    "Mercado observado",
     "Sobre e transparência",
 ])
 
@@ -1224,8 +1497,11 @@ st.markdown("Arquivo único consolidado. Para mercado real e macro global, insta
 with tabs[9]:
     render_monitoring_panel()
 
-
 with tabs[10]:
+    live_market_panel()
+
+
+with tabs[11]:
     st.subheader("Sobre o observatório")
     st.markdown("""
     **Natureza:** projeto independente de análise e visualização de dados públicos.
