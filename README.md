@@ -11,6 +11,8 @@ Painel analítico **independente**, com interface de inspiração institucional,
 - Correlações, rupturas e análise espectral
 - Setores de mercado, ETFs e ações
 - Índices mundiais, câmbio, criptoativos e commodities
+- Aba **Mercado observado**: cotações reais, horários de observação, fonte, nível de atualização e exportação CSV
+- Coinbase Exchange para preços recentes de criptoativos; Yahoo Finance para barras indicativas de mercado; Banco Central (SGS 432 e 433) para referências oficiais
 - Sinais macro de natureza heurística
 - Notícias gerais, conflitos, governos e Defesa Civil local
 - Consultas GDACS, NASA EONET, GDELT, feeds RSS e links oficiais
@@ -31,7 +33,15 @@ streamlit run app.py
 
 O dashboard fica normalmente em `http://localhost:8501`.
 
-## Publicação: GitHub + Streamlit Community Cloud
+## Publicação atual: GitHub + Render
+
+**Aplicativo online:** https://data-amanha.onrender.com
+
+**Código:** https://github.com/douglassnake/data-amanha
+
+O serviço gratuito do Render pode dormir por inatividade. Deploys são acionados automaticamente a partir da branch main. O painel não contém credenciais nem operações de corretora.
+
+## Alternativa: Streamlit Community Cloud
 
 O GitHub **não executa o Streamlit em GitHub Pages**. Publique o código no repositório `douglassnake/data-amanha` e execute o aplicativo na [Streamlit Community Cloud](https://share.streamlit.io/).
 
@@ -75,4 +85,30 @@ As dependências aceitam faixas de versões; para implantação auditável, gere
 
 Código no GitHub: https://github.com/douglassnake/data-amanha
 
-**Aplicativo online:** a implantação do Streamlit Community Cloud requer autorização na conta do serviço e escolha da URL de hospedagem. Até que isso ocorra, o GitHub publica apenas o código, não a interface Streamlit em execução.
+**O Render já hospeda este aplicativo.** O Streamlit Community Cloud é alternativa, não depende de nova publicação para o serviço atual.
+
+## Qualidade e disponibilidade de preços
+
+- **Criptoativos:** a Coinbase Exchange informa o horário do último negócio; não há garantia de negociação a cada segundo.
+- **Ações, ETFs, índices, câmbio e commodities:** o yfinance consulta barras de 5 minutos do Yahoo Finance. Há possíveis atrasos, restrições de bolsa, horários de negociação e indisponibilidade. A tabela mostra hora da observação e é sempre classificada como *indicativa*.
+- **Referências Brasil:** meta Selic (Banco Central, SGS 432, % ao ano) e IPCA (SGS 433, % no mês) são séries oficiais atualizadas conforme publicação, não cotações instantâneas.
+- **Consulta:** fragmento do Streamlit verifica novamente a cada 60 segundos durante uso ativo; caches de 30 segundos para Coinbase, 120 segundos para barras indicativas e 1 hora para BCB. A data da consulta nunca substitui o horário da observação.
+- **Proteção:** fontes que falharem não serão substituídas por valores fictícios. Os dados históricos heurísticos nunca serão confundidos com preços observados.
+
+### Cotações licenciadas (opcional)
+
+A aplicação já oferece integração condicional com [Twelve Data](https://twelvedata.com/docs), mas **não está ativa por padrão**. Antes de exibir dados licenciados publicamente, obtenha permissão expressa para redistribuição no site e configure na hospedagem (não no GitHub):
+
+- TWELVE_DATA_API_KEY = segredo do fornecedor
+- MARKET_PUBLIC_DISPLAY_LICENSED = 1 **somente se o contrato permitir exibição pública**
+
+O plano gratuito do fornecedor pode ser restrito a uso pessoal/interno; a existência de uma API key não implica autorização para mostrar dados ao público. Para monitoramento de trading, use um feed de bolsa licenciado, com SLA e validação de atraso.
+
+### Testes
+
+```bash
+python -m py_compile app.py
+python -m unittest discover -s tests -v
+```
+
+Os testes verificam recusa de preços inválidos, exigência de timestamp real na Coinbase e tratamento de barras com fuso ausente.
