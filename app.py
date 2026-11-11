@@ -584,7 +584,12 @@ def market_timestamp(value):
     if value is None or value == "":
         return None
     try:
-        ts = pd.to_datetime(value, utc=True, errors="coerce")
+        # Timestamps UNIX da Twelve Data podem vir em segundos ou milissegundos.
+        numeric = str(value).strip()
+        if numeric.isdigit() and len(numeric) in (10, 13):
+            ts = pd.to_datetime(int(numeric), unit="s" if len(numeric) == 10 else "ms", utc=True, errors="coerce")
+        else:
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
         return None if pd.isna(ts) else ts.to_pydatetime()
     except (ValueError, TypeError, OverflowError):
         return None
@@ -728,6 +733,13 @@ def fetch_bcb_reference():
             data = response.json()
             item = data[-1] if isinstance(data,list) and data else None
             if not isinstance(item,dict):
+                continue
+            # Rejeita datas futuras e inválidas em séries de referência oficiais.
+            try:
+                ref_date = datetime.strptime(str(item.get("data", "")), "%d/%m/%Y").date()
+                if ref_date > datetime.now(ZoneInfo("America/Sao_Paulo")).date():
+                    continue
+            except ValueError:
                 continue
             value = float(str(item.get("valor","")).replace(",","."))
             if np.isfinite(value):
